@@ -110,6 +110,27 @@ function buildQuery({ category, country, lang, keyword }) {
   return parts.join(" ");
 }
 
+// GDELT explicitly asks for no more than 1 request every 5 seconds.
+// We enforce that globally (across every user of this backend) with a queue,
+// and cache successful results for 5 minutes so repeat/refresh requests
+// don't need to call GDELT again at all.
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const newsCache = new Map();
+const MIN_GDELT_INTERVAL_MS = 5500;
+let gdeltQueue = Promise.resolve();
+let lastGdeltCallAt = 0;
+
+function scheduleGdeltCall(fn) {
+  const result = gdeltQueue.then(async () => {
+    const wait = Math.max(0, MIN_GDELT_INTERVAL_MS - (Date.now() - lastGdeltCallAt));
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastGdeltCallAt = Date.now();
+    return fn();
+  });
+  gdeltQueue = result.then(() => {}, () => {}); // keep the queue alive even if this call fails
+  return result;
+}
+
 async function fetchGdeltWithRetry(urlString, attempt = 1) {
   const gdeltRes = await fetch(urlString, {
     headers: {
@@ -117,8 +138,8 @@ async function fetchGdeltWithRetry(urlString, attempt = 1) {
       "Accept": "application/json",
     },
   });
-  if ((gdeltRes.status === 429 || gdeltRes.status === 502 || gdeltRes.status === 503) && attempt < 3) {
-    await new Promise((resolve) => setTimeout(resolve, attempt * 800));
+  if ((gdeltRes.status === 429 || gdeltRes.status === 502 || gdeltRes.status === 503) && attempt < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 5500));
     return fetchGdeltWithRetry(urlString, attempt + 1);
   }
   return gdeltRes;
@@ -137,11 +158,17 @@ app.get("/api/news", async (req, res) => {
     url.searchParams.set("maxrecords", maxrecords || "25");
     url.searchParams.set("timespan", timespan || "1d");
 
-    const gdeltRes = await fetchGdeltWithRetry(url.toString());
+    const cacheKey = url.toString();
+    const cached = newsCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json({ ...cached.body, cached: true });
+    }
+
+    const gdeltRes = await scheduleGdeltCall(() => fetchGdeltWithRetry(cacheKey));
 
     if (!gdeltRes.ok) {
       return res.status(502).json({
-        error: "GDELT request failed after retries",
+        error: "GDELT request failed after retry",
         status: gdeltRes.status,
         query,
       });
@@ -166,7 +193,10 @@ app.get("/api/news", async (req, res) => {
       image: a.socialimage || null,
     }));
 
-    res.json({ query, count: articles.length, fetchedAt: new Date().toISOString(), articles });
+    const responseBody = { query, count: articles.length, fetchedAt: new Date().toISOString(), articles };
+    newsCache.set(cacheKey, { body: responseBody, expiresAt: Date.now() + CACHE_TTL_MS });
+
+    res.json(responseBody);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
